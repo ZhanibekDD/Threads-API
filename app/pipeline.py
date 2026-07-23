@@ -9,6 +9,7 @@ This is a deliberate design boundary, not a missing feature.
 """
 
 import logging
+import math
 import sqlite3
 from datetime import datetime, timezone
 
@@ -22,24 +23,32 @@ from app.whatsapp import shorten_cta_if_needed
 
 logger = logging.getLogger("pipeline")
 
-# The project has dozens of phrases. Searching every phrase every hour wastes
-# the Meta search quota and makes the worker look alive while every call is
-# being rejected. Two phrases per cycle covers the full list in under a day
-# while keeping a large safety margin for manual searches from the panel.
-DEFAULT_KEYWORDS_PER_CYCLE = 2
+# Keep a minimum safety batch, then dynamically enlarge it so every keyword is
+# searched comfortably inside POST_MAX_AGE_HOURS. The extra batch is a buffer
+# against a delayed/restarted Docker worker skipping one wall-clock slot.
+MIN_KEYWORDS_PER_CYCLE = 2
 
 
 def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def _keywords_per_cycle(keyword_count: int) -> int:
+    if keyword_count <= 0:
+        return 0
+    interval_hours = max(config.search_interval_minutes, 1) / 60
+    freshness_hours = max(config.post_max_age_hours, 1)
+    required = math.ceil(keyword_count * interval_hours / freshness_hours)
+    return min(keyword_count, max(MIN_KEYWORDS_PER_CYCLE, required + 1))
+
+
 def _scheduled_keywords(keywords: list[str]) -> list[str]:
     """Return a deterministic rotating keyword slice for the current worker
-    interval. A restart in the same interval repeats the same tiny slice rather
-    than unexpectedly consuming another full-list burst."""
+    interval. A restart in the same interval repeats the same slice rather than
+    unexpectedly consuming another full-list burst."""
     if not keywords:
         return []
-    batch_size = min(DEFAULT_KEYWORDS_PER_CYCLE, len(keywords))
+    batch_size = _keywords_per_cycle(len(keywords))
     interval_seconds = max(config.search_interval_minutes * 60, 60)
     slot = int(datetime.now(timezone.utc).timestamp() // interval_seconds)
     start = (slot * batch_size) % len(keywords)
@@ -68,9 +77,9 @@ def _upsert_author_seen(conn: sqlite3.Connection, author_id: str, username: str)
 
 async def search_and_ingest(threads: ThreadsClient, deepseek: DeepSeekClient,
                              conn: sqlite3.Connection, keywords: list[str] | None = None) -> dict:
-    """One search cycle. Automatic cycles rotate through a small keyword
-    batch; explicitly supplied keywords (for example from the web panel) are
-    searched exactly as requested."""
+    """One search cycle. Automatic cycles rotate through a keyword batch sized
+    to revisit every phrase before a post becomes too old. Explicitly supplied
+    keywords (for example from the web panel) are searched exactly as requested."""
     active_keywords = _scheduled_keywords(ALL_KEYWORDS) if keywords is None else keywords
     summary = {
         "searched": 0,
@@ -82,6 +91,20 @@ async def search_and_ingest(threads: ThreadsClient, deepseek: DeepSeekClient,
     }
     today = _today()
     logger.info("search_cycle_started keywords=%s", active_keywords)
+
+    # The OAuth token already identifies the account. Resolve it once so the
+    # search pipeline never treats the business's own posts as sales leads when
+    # THREADS_USER_ID is intentionally omitted from .env.
+    own_user_id = config.threads_user_id
+    if not own_user_id and isinstance(threads, ThreadsClient):
+        try:
+            own_user_id = await threads._get_user_id()
+        except ThreadsAPIError as exc:
+            logger.warning("own_user_id_resolution_failed status=%s", exc.status_code)
+            summary["own_user_id_error"] = {
+                "status_code": exc.status_code,
+                "payload": exc.payload,
+            }
 
     for keyword in active_keywords:
         summary["searched"] += 1
@@ -102,15 +125,17 @@ async def search_and_ingest(threads: ThreadsClient, deepseek: DeepSeekClient,
         for raw_item in result.get("data", []):
             summary["found"] += 1
             touch_daily_metric(conn, today, posts_found=1)
-            item = dict(raw_item)
-            item["_matched_keyword"] = keyword
             try:
-                outcome = await _process_post(threads, deepseek, conn, item, today)
+                item = dict(raw_item or {})
+                item["_matched_keyword"] = keyword
+                outcome = await _process_post(
+                    threads, deepseek, conn, item, today, own_user_id=own_user_id
+                )
             except Exception:
                 # One malformed API item, database edge case, or downstream
                 # model error must not kill the entire long-running worker.
-                logger.exception("post_processing_failed post_id=%s keyword=%s",
-                                 item.get("id"), keyword)
+                post_id = raw_item.get("id") if isinstance(raw_item, dict) else None
+                logger.exception("post_processing_failed post_id=%s keyword=%s", post_id, keyword)
                 touch_daily_metric(conn, today, errors=1)
                 summary["errors"] += 1
                 summary["skipped"] += 1
@@ -125,7 +150,8 @@ async def search_and_ingest(threads: ThreadsClient, deepseek: DeepSeekClient,
 
 
 async def _process_post(threads: ThreadsClient, deepseek: DeepSeekClient,
-                         conn: sqlite3.Connection, item: dict, today: str) -> str:
+                         conn: sqlite3.Connection, item: dict, today: str,
+                         own_user_id: str | None = None) -> str:
     post_id = item.get("id")
     username = item.get("username", "")
     owner = item.get("owner") or {}
@@ -143,7 +169,8 @@ async def _process_post(threads: ThreadsClient, deepseek: DeepSeekClient,
     if conn.execute("SELECT 1 FROM threads_posts WHERE threads_post_id = ?", (post_id,)).fetchone():
         return "skipped"
 
-    if author_id == config.threads_user_id:
+    if own_user_id and author_id == own_user_id:
+        logger.info("post_skipped_own_account post_id=%s", post_id)
         return "skipped"
 
     if post_too_old(published_at, config.post_max_age_hours):
@@ -243,11 +270,9 @@ async def publish_approved_reply(threads: ThreadsClient, conn: sqlite3.Connectio
     post = conn.execute("SELECT * FROM threads_posts WHERE id = ?", (reply["post_id"],)).fetchone()
 
     if config.dry_run:
+        # A simulation must never mutate the row into a falsely published state;
+        # otherwise switching to LIVE later permanently loses the approved lead.
         logger.info("dry_run_would_publish reply_id=%s post_id=%s", reply_id, post["threads_post_id"])
-        conn.execute(
-            "UPDATE generated_replies SET published = 1, published_at = ?, "
-            "threads_reply_id = 'DRY_RUN' WHERE id = ?", (now_iso(), reply_id)
-        )
         return {"status": "dry_run_ok"}
 
     try:
