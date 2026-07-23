@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from app import oauth
 from app.config import config
 from app.content_generator import (
+    THREADS_POST_MAX_CHARS,
     export_content,
     generate_daily_content_plan,
     is_publish_time_now,
@@ -169,7 +170,7 @@ async def cmd_publish_own_content(content_id: int) -> None:
 def cmd_list_content() -> None:
     with session() as conn:
         rows = conn.execute(
-            "SELECT id, type, language, approved, published, content FROM own_content "
+            "SELECT id, type, language, approved, published, content, error FROM own_content "
             "WHERE published = 0 ORDER BY id"
         ).fetchall()
         if not rows:
@@ -177,17 +178,24 @@ def cmd_list_content() -> None:
             return
         for r in rows:
             flag = "approved" if r["approved"] else "needs approval"
-            print(f"\n[{r['id']}] {r['type']} ({r['language']}) — {flag}")
+            print(f"\n[{r['id']}] {r['type']} ({r['language']}) — {flag} — {len(r['content'])} символов")
+            if r["error"]:
+                print(f"  ОШИБКА: {r['error']}")
             print(f"  {r['content'][:200]}")
 
 
 def cmd_approve_content(content_id: int) -> None:
     with session() as conn:
-        row = conn.execute("SELECT id FROM own_content WHERE id = ?", (content_id,)).fetchone()
+        row = conn.execute("SELECT id, content FROM own_content WHERE id = ?", (content_id,)).fetchone()
         if row is None:
             print(f"own_content id={content_id} не найден")
             return
-        conn.execute("UPDATE own_content SET approved = 1 WHERE id = ?", (content_id,))
+        length = len(row["content"])
+        if length > THREADS_POST_MAX_CHARS:
+            print(f"own_content id={content_id} НЕ одобрен: {length} символов, "
+                  f"лимит Threads — {THREADS_POST_MAX_CHARS}. Сократите текст и повторите.")
+            return
+        conn.execute("UPDATE own_content SET approved = 1, error = NULL WHERE id = ?", (content_id,))
     print(f"own_content id={content_id} одобрен — выйдет в ближайший слот "
           f"({config.own_content_publish_times}, {config.own_content_timezone}), "
           f"если AUTO_PUBLISH_OWN_CONTENT=true.")
@@ -206,14 +214,20 @@ async def cmd_run_content_scheduler() -> None:
             local_now = now.astimezone(ZoneInfo(config.own_content_timezone))
             slot_key = f"{local_now.date().isoformat()}_{local_now.strftime('%H:%M')}"
             if slot_key != last_slot_key:
-                with session() as conn:
-                    threads = _threads_client(conn)
-                    try:
-                        result = await publish_next_approved(threads, conn)
-                    finally:
-                        await threads.aclose()
-                logger.info("content_scheduler_tick result=%s", result)
+                # Set BEFORE attempting: a slot fires at most once no matter
+                # what happens below — an unexpected error must never turn
+                # into a crash-restart-retry loop within the same slot.
                 last_slot_key = slot_key
+                try:
+                    with session() as conn:
+                        threads = _threads_client(conn)
+                        try:
+                            result = await publish_next_approved(threads, conn)
+                        finally:
+                            await threads.aclose()
+                    logger.info("content_scheduler_tick result=%s", result)
+                except Exception:
+                    logger.exception("content_scheduler_tick_failed")
         await asyncio.sleep(30)
 
 

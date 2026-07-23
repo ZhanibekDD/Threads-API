@@ -17,9 +17,14 @@ from zoneinfo import ZoneInfo
 from app.config import config
 from app.db import now_iso
 from app.deepseek_client import DeepSeekClient
-from app.threads_client import ThreadsClient
+from app.threads_client import ThreadsAPIError, ThreadsClient
 
 logger = logging.getLogger("content_generator")
+
+# Threads rejects text posts over this length ("Param text must be at most
+# 500 characters long"). Checked before ever calling the API — see
+# publish_next_approved().
+THREADS_POST_MAX_CHARS = 500
 
 OWN_CONTENT_SYSTEM_PROMPT = """Ты — контент-маркетолог юридического сервиса ZakonExpert (Казахстан).
 Сайт: https://zakonexpertt.kz/  WhatsApp: +7 775 299-87-38.
@@ -141,7 +146,7 @@ async def publish_next_approved(threads: ThreadsClient, conn: sqlite3.Connection
     """
     row = conn.execute(
         "SELECT * FROM own_content WHERE type = 'post' AND approved = 1 AND published = 0 "
-        "ORDER BY id LIMIT 1"
+        "AND error IS NULL ORDER BY id LIMIT 1"
     ).fetchone()
     if row is None:
         return {"status": "nothing_to_publish"}
@@ -150,7 +155,26 @@ async def publish_next_approved(threads: ThreadsClient, conn: sqlite3.Connection
         logger.info("auto_publish_own_content_disabled_would_publish id=%s", row["id"])
         return {"status": "disabled", "id": row["id"]}
 
-    post_id = await threads.create_own_post(row["content"])
+    # Checked up front so an oversized post can never reach the API (and
+    # never permanently block every post behind it — see the `error IS NULL`
+    # filter above, which skips it on future ticks once flagged).
+    length = len(row["content"])
+    if length > THREADS_POST_MAX_CHARS:
+        error = f"content is {length} chars, over the {THREADS_POST_MAX_CHARS} limit — needs manual editing"
+        conn.execute("UPDATE own_content SET approved = 0, error = ? WHERE id = ?", (error, row["id"]))
+        conn.commit()
+        logger.warning("own_content_too_long id=%s length=%s", row["id"], length)
+        return {"status": "content_too_long", "id": row["id"], "length": length}
+
+    try:
+        post_id = await threads.create_own_post(row["content"])
+    except ThreadsAPIError as exc:
+        error = f"threads_api_error:{exc.status_code}"
+        conn.execute("UPDATE own_content SET approved = 0, error = ? WHERE id = ?", (error, row["id"]))
+        conn.commit()
+        logger.error("own_content_publish_failed id=%s status=%s", row["id"], exc.status_code)
+        return {"status": "error", "id": row["id"], "error": error}
+
     conn.execute(
         "UPDATE own_content SET published = 1, published_at = ?, threads_post_id = ?, exported = 1 "
         "WHERE id = ?",

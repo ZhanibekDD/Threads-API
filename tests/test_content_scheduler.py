@@ -5,12 +5,14 @@ import pytest
 
 from app.config import config
 from app.content_generator import (
+    THREADS_POST_MAX_CHARS,
     current_local_slot,
     is_publish_time_now,
     parse_publish_times,
     publish_next_approved,
 )
 from app.db import now_iso
+from app.threads_client import ThreadsAPIError
 
 
 def test_parse_publish_times_strips_whitespace():
@@ -108,6 +110,77 @@ async def test_publish_next_approved_publishes_and_marks_row(conn):
     assert row["published"] == 1
     assert row["threads_post_id"] == "threads_post_123"
     assert row["published_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_publish_next_approved_rejects_oversized_content_without_calling_api(conn):
+    long_text = "a" * (THREADS_POST_MAX_CHARS + 1)
+    conn.execute(
+        "INSERT INTO own_content (type, language, content, created_at, approved) "
+        "VALUES ('post', 'ru', ?, ?, 1)", (long_text, now_iso())
+    )
+    conn.commit()
+    row_id = conn.execute("SELECT id FROM own_content").fetchone()["id"]
+
+    object.__setattr__(config, "auto_publish_own_content", True)
+    threads = AsyncMock()
+
+    result = await publish_next_approved(threads, conn)
+
+    assert result["status"] == "content_too_long"
+    assert result["id"] == row_id
+    threads.create_own_post.assert_not_called()
+
+    row = conn.execute("SELECT approved, error FROM own_content WHERE id = ?", (row_id,)).fetchone()
+    assert row["approved"] == 0  # unapproved so it can't crash-loop the scheduler
+    assert "500" in row["error"]
+
+
+@pytest.mark.asyncio
+async def test_publish_next_approved_oversized_item_does_not_block_next_valid_one(conn):
+    long_text = "a" * (THREADS_POST_MAX_CHARS + 1)
+    conn.execute(
+        "INSERT INTO own_content (type, language, content, created_at, approved) "
+        "VALUES ('post', 'ru', ?, ?, 1)", (long_text, now_iso())
+    )
+    conn.execute(
+        "INSERT INTO own_content (type, language, content, created_at, approved) "
+        "VALUES ('post', 'ru', 'short valid post', ?, 1)", (now_iso(),)
+    )
+    conn.commit()
+
+    object.__setattr__(config, "auto_publish_own_content", True)
+    threads = AsyncMock()
+    threads.create_own_post.return_value = "threads_id_ok"
+
+    first = await publish_next_approved(threads, conn)
+    assert first["status"] == "content_too_long"
+
+    second = await publish_next_approved(threads, conn)
+    assert second["status"] == "published"
+    threads.create_own_post.assert_called_once_with("short valid post")
+
+
+@pytest.mark.asyncio
+async def test_publish_next_approved_handles_api_error_without_raising(conn):
+    conn.execute(
+        "INSERT INTO own_content (type, language, content, created_at, approved) "
+        "VALUES ('post', 'ru', 'approved post', ?, 1)", (now_iso(),)
+    )
+    conn.commit()
+    row_id = conn.execute("SELECT id FROM own_content").fetchone()["id"]
+
+    object.__setattr__(config, "auto_publish_own_content", True)
+    threads = AsyncMock()
+    threads.create_own_post.side_effect = ThreadsAPIError(500, {"error": "boom"})
+
+    result = await publish_next_approved(threads, conn)
+
+    assert result["status"] == "error"
+    row = conn.execute("SELECT approved, published, error FROM own_content WHERE id = ?", (row_id,)).fetchone()
+    assert row["approved"] == 0
+    assert row["published"] == 0
+    assert row["error"] is not None
 
 
 @pytest.mark.asyncio

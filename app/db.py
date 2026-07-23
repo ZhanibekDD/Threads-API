@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS own_content (
     approved INTEGER NOT NULL DEFAULT 0,
     published INTEGER NOT NULL DEFAULT 0,
     published_at TEXT,
-    threads_post_id TEXT
+    threads_post_id TEXT,
+    error TEXT
 );
 
 -- Single-account internal tool: one row (id=1) holds the current OAuth token.
@@ -121,6 +122,7 @@ _OWN_CONTENT_MIGRATIONS = [
     "ALTER TABLE own_content ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE own_content ADD COLUMN published_at TEXT",
     "ALTER TABLE own_content ADD COLUMN threads_post_id TEXT",
+    "ALTER TABLE own_content ADD COLUMN error TEXT",
 ]
 
 
