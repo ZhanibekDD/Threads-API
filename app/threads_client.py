@@ -12,7 +12,6 @@ occasionally revises paths/params.
 
 import asyncio
 import logging
-import time
 
 import httpx
 
@@ -21,6 +20,7 @@ from app.config import config
 logger = logging.getLogger("threads_client")
 
 GRAPH_BASE = "https://graph.threads.net"
+DEFAULT_SEARCH_FIELDS = "id,username,text,permalink,timestamp,owner"
 
 
 class ThreadsAPIError(Exception):
@@ -35,19 +35,45 @@ class RateLimitError(ThreadsAPIError):
 
 
 class ThreadsClient:
-    def __init__(self, access_token: str | None = None, api_version: str | None = None):
+    def __init__(
+        self,
+        access_token: str | None = None,
+        api_version: str | None = None,
+        user_id: str | None = None,
+    ):
         self.access_token = access_token or config.threads_access_token
         self.api_version = api_version or config.threads_api_version
+        self.user_id = user_id or config.threads_user_id
         self._client = httpx.AsyncClient(base_url=GRAPH_BASE, timeout=20.0)
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    def _require_user_id(self) -> str:
+        if not self.user_id:
+            raise ThreadsAPIError(
+                400,
+                {
+                    "error": {
+                        "message": (
+                            "Threads user id is missing. Reconnect the account in the review panel "
+                            "or set THREADS_USER_ID in .env."
+                        )
+                    }
+                },
+            )
+        return self.user_id
+
     async def _request(self, method: str, path: str, *, params: dict | None = None,
-                        json: dict | None = None, data: dict | None = None,
-                        include_token: bool = True, max_retries: int = 4) -> dict:
+                         json: dict | None = None, data: dict | None = None,
+                         include_token: bool = True, max_retries: int = 4) -> dict:
         params = dict(params or {})
-        if include_token and self.access_token:
+        if include_token:
+            if not self.access_token:
+                raise ThreadsAPIError(
+                    401,
+                    {"error": {"message": "Threads access token is missing. Connect the account first."}},
+                )
             params.setdefault("access_token", self.access_token)
 
         attempt = 0
@@ -81,7 +107,7 @@ class ThreadsClient:
                 await asyncio.sleep(delay)
                 continue
 
-            logger.error("threads_api_error status=%s", resp.status_code)
+            logger.error("threads_api_error status=%s payload=%s", resp.status_code, payload)
             raise ThreadsAPIError(resp.status_code, payload)
 
     # -- OAuth / token lifecycle -------------------------------------------------
@@ -89,9 +115,9 @@ class ThreadsClient:
     async def exchange_code_for_token(self, code: str) -> dict:
         """Sent as a form-encoded POST body (not query params) so the
         one-time authorization `code` never ends up in a logged request URL.
-        Uses `include_token=False` since there is no access token yet at
-        this point in the flow — the app credentials are what authenticate
-        this specific call."""
+        Uses `include_token=False` since there is no access token yet at this
+        point in the flow — the app credentials are what authenticate this
+        specific call."""
         return await self._request(
             "POST",
             "/oauth/access_token",
@@ -130,8 +156,17 @@ class ThreadsClient:
     # -- Search / discovery -------------------------------------------------
 
     async def keyword_search(self, query: str, search_type: str = "RECENT",
-                              limit: int = 25, after: str | None = None) -> dict:
-        params = {"q": query, "search_type": search_type, "limit": limit}
+                              limit: int = 25, after: str | None = None,
+                              fields: str = DEFAULT_SEARCH_FIELDS) -> dict:
+        # Meta's official examples include `fields`. Without it some API
+        # versions may return only IDs, which makes the ingestion pipeline
+        # silently skip every result because text/timestamp are absent.
+        params = {
+            "q": query,
+            "search_type": search_type,
+            "limit": limit,
+            "fields": fields,
+        }
         if after:
             params["after"] = after
         return await self._request("GET", "/keyword_search", params=params)
@@ -141,7 +176,7 @@ class ThreadsClient:
 
     async def get_mentions(self, fields: str = "id,text,username,permalink,timestamp") -> dict:
         return await self._request(
-            "GET", f"/{config.threads_user_id}/mentions", params={"fields": fields}
+            "GET", f"/{self._require_user_id()}/mentions", params={"fields": fields}
         )
 
     async def get_replies(self, media_id: str,
@@ -153,14 +188,14 @@ class ThreadsClient:
     async def create_reply_container(self, text: str, reply_to_id: str) -> dict:
         return await self._request(
             "POST",
-            f"/{config.threads_user_id}/threads",
+            f"/{self._require_user_id()}/threads",
             params={"media_type": "TEXT", "text": text, "reply_to_id": reply_to_id},
         )
 
     async def publish_container(self, creation_id: str) -> dict:
         return await self._request(
             "POST",
-            f"/{config.threads_user_id}/threads_publish",
+            f"/{self._require_user_id()}/threads_publish",
             params={"creation_id": creation_id},
         )
 
@@ -181,7 +216,7 @@ class ThreadsClient:
     async def create_own_post(self, text: str) -> str:
         container = await self._request(
             "POST",
-            f"/{config.threads_user_id}/threads",
+            f"/{self._require_user_id()}/threads",
             params={"media_type": "TEXT", "text": text},
         )
         await asyncio.sleep(2)
