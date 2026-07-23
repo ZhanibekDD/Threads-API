@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>ZakonExpert — Threads Review Panel</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.3rem; }
+    .status { padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; }
+    .status.connected { background: #e6f4ea; border: 1px solid #34a853; }
+    .status.disconnected { background: #fce8e6; border: 1px solid #ea4335; }
+    .status.warn { background: #fff4e5; border: 1px solid #f9ab00; }
+    .flash { padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 0.5rem; }
+    .flash.success { background: #e6f4ea; }
+    .flash.error { background: #fce8e6; }
+    .flash.info { background: #e8f0fe; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    .meta { color: #666; font-size: 0.85rem; }
+    .score { font-weight: bold; }
+    .draft { background: #fafafa; border-left: 3px solid #999; padding: 0.5rem 0.75rem; margin: 0.5rem 0; white-space: pre-wrap; }
+    form.inline { display: inline; }
+    button { cursor: pointer; padding: 0.4rem 0.9rem; border-radius: 6px; border: 1px solid #ccc; background: #fff; }
+    button.approve { background: #34a853; color: #fff; border-color: #34a853; }
+    button.reject { background: #ea4335; color: #fff; border-color: #ea4335; }
+    .search-box { display: flex; gap: 0.5rem; margin: 1rem 0; }
+    .search-box input[type=text] { flex: 1; padding: 0.5rem; }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; background: #eee; font-size: 0.8rem; }
+    a { color: #1a73e8; }
+  </style>
+</head>
+<body>
+  <h1>ZakonExpert — Threads Review Panel</h1>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  {% if status.connected %}
+    <div class="status {{ 'warn' if status.expired or status.expires_soon else 'connected' }}">
+      Подключено: <strong>@{{ status.threads_username }}</strong>
+      {% if status.expired %}
+        — <strong>токен истёк</strong>, переподключите аккаунт.
+      {% elif status.expires_soon %}
+        — токен истекает {{ status.expires_at }}, скоро понадобится обновление.
+      {% else %}
+        — токен действителен до {{ status.expires_at }}.
+      {% endif %}
+    </div>
+  {% else %}
+    <div class="status disconnected">
+      Аккаунт Threads не подключён.
+      {% if not threads_app_id_set or not redirect_uri %}
+        <br>Заполните <code>THREADS_APP_ID</code> и <code>THREADS_REDIRECT_URI</code> в <code>.env</code> перед подключением.
+      {% else %}
+        <br><a href="{{ url_for('threads_connect') }}">Подключить аккаунт Threads →</a>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  <div class="meta">
+    Режим: <span class="badge">{{ 'DRY_RUN' if dry_run else 'LIVE' }}</span>
+    <span class="badge">OAuth stage {{ oauth_stage }}</span>
+    — публикация ответа на чужой пост требует явного нажатия «Одобрить» ниже,
+    ни один пост не публикуется автоматически.
+  </div>
+
+  <form class="search-box" method="post" action="{{ url_for('search') }}">
+    <input type="text" name="query" placeholder="Например: арестовали Kaspi" required>
+    <button type="submit">Искать</button>
+  </form>
+
+  <h2>Очередь на подтверждение</h2>
+  {% if not queue %}
+    <p class="meta">Пусто. Запустите поиск выше.</p>
+  {% endif %}
+  {% for item in queue %}
+    <div class="card">
+      <div class="meta">
+        <span class="score">score {{ item.lead_score }}</span> ·
+        {{ item.language }} · {{ item.problem_type }} · {{ item.decision }}
+      </div>
+      <p>{{ item.text }}</p>
+      {% if item.permalink %}<p><a href="{{ item.permalink }}" target="_blank">{{ item.permalink }}</a></p>{% endif %}
+      <div class="draft">{{ item.generated_text }}</div>
+      <form class="inline" method="post" action="{{ url_for('approve_reply', reply_id=item.reply_id) }}">
+        <button type="submit" class="approve">✅ Одобрить{{ ' и опубликовать' if not dry_run else ' (DRY_RUN)' }}</button>
+      </form>
+      <form class="inline" method="post" action="{{ url_for('reject_reply', reply_id=item.reply_id) }}">
+        <button type="submit" class="reject">✕ Отклонить</button>
+      </form>
+    </div>
+  {% endfor %}
+
+  <h2>Последние опубликованные</h2>
+  {% if not recent %}
+    <p class="meta">Пока ничего не опубликовано.</p>
+  {% endif %}
+  {% for item in recent %}
+    <div class="card">
+      <div class="meta">{{ item.published_at }} · threads_reply_id: {{ item.threads_reply_id }}</div>
+      {% if item.permalink %}<p><a href="{{ item.permalink }}" target="_blank">{{ item.permalink }}</a></p>{% endif %}
+    </div>
+  {% endfor %}
+</body>
+</html>

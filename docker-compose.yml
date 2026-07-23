@@ -1,0 +1,58 @@
+services:
+  web:
+    build: .
+    command: python -m app.main run-web
+    ports:
+      - "5000:5000"
+    env_file: .env
+    environment:
+      # Loopback binding inside a container is unreachable from outside it —
+      # must be 0.0.0.0 here regardless of what .env has for bare-metal use.
+      REVIEW_PANEL_HOST: "0.0.0.0"
+    volumes:
+      - ./data:/app/data
+      - ./exports:/app/exports
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  search-loop:
+    build: .
+    command: python -m app.main run-loop
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - web
+
+  content-scheduler:
+    build: .
+    command: python -m app.main run-content-scheduler
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - web
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --url http://web:5000
+    restart: unless-stopped
+    depends_on:
+      - web
+
+  # Optional: uncomment once TELEGRAM_BOT_TOKEN is set in .env — otherwise
+  # this crash-loops (run_polling() refuses to start without a token).
+  # telegram-bot:
+  #   build: .
+  #   command: python -m app.main run-telegram
+  #   env_file: .env
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./logs:/app/logs
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - web
