@@ -14,19 +14,27 @@ FAKE_LONG_TOKEN = "LONG_LIVED_TEST_TOKEN_xyz789do_not_leak"
 
 @pytest.fixture()
 def web_client():
-    """Point the whole app at a throwaway sqlite file so /threads/connect and
-    /threads/callback (two separate db_session() calls) see the same state,
-    then restore the original path."""
+    """Point the app at a throwaway sqlite file and explicit fake OAuth
+    settings. Tests must not depend on an uncommitted developer .env file."""
     tmp_dir = tempfile.mkdtemp()
     tmp_db = str(Path(tmp_dir) / "test_web.db")
-    original_path = config.database_path
+    originals = {
+        "database_path": config.database_path,
+        "threads_app_id": config.threads_app_id,
+        "threads_app_secret": config.threads_app_secret,
+        "threads_redirect_uri": config.threads_redirect_uri,
+    }
     object.__setattr__(config, "database_path", tmp_db)
+    object.__setattr__(config, "threads_app_id", "test-app-id")
+    object.__setattr__(config, "threads_app_secret", "test-app-secret")
+    object.__setattr__(config, "threads_redirect_uri", "http://127.0.0.1:5000/threads/callback")
     try:
         import app.web as web
         web.app.testing = True
         yield web.app.test_client()
     finally:
-        object.__setattr__(config, "database_path", original_path)
+        for name, value in originals.items():
+            object.__setattr__(config, name, value)
 
 
 def _mocked_exchange():
