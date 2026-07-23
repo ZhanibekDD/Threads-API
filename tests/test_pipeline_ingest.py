@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.config import config
+from app.config import ALL_KEYWORDS, config
 from app.db import now_iso
-from app.pipeline import _process_post
+from app.pipeline import _keywords_per_cycle, _process_post, search_and_ingest
 
 
 def _item(post_id="post-1", author="author-1", text="Kaspi арестовали счет, что делать?"):
@@ -115,3 +115,50 @@ async def test_too_old_post_is_skipped_before_deepseek_call(conn):
                                    datetime.now(timezone.utc).date().isoformat())
     assert outcome == "skipped"
     deepseek.analyze_post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_own_account_post_is_skipped(conn):
+    threads = AsyncMock()
+    deepseek = _deepseek(score=95, decision="auto_publish")
+    outcome = await _process_post(
+        threads,
+        deepseek,
+        conn,
+        _item(author="business-user-id"),
+        datetime.now(timezone.utc).date().isoformat(),
+        own_user_id="business-user-id",
+    )
+    assert outcome == "skipped"
+    deepseek.analyze_post.assert_not_called()
+    assert conn.execute("SELECT COUNT(*) c FROM threads_posts").fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_api_item_does_not_stop_cycle(conn):
+    threads = AsyncMock()
+    threads.keyword_search.return_value = {"data": [None]}
+    deepseek = _deepseek(score=85, decision="manual_review")
+
+    summary = await search_and_ingest(threads, deepseek, conn, keywords=["арест счета"])
+
+    assert summary["searched"] == 1
+    assert summary["found"] == 1
+    assert summary["skipped"] == 1
+    assert summary["errors"] == 0
+    deepseek.analyze_post.assert_not_called()
+
+
+def test_automatic_batch_revisits_keywords_before_freshness_expires():
+    original_interval = config.search_interval_minutes
+    original_age = config.post_max_age_hours
+    try:
+        object.__setattr__(config, "search_interval_minutes", 60)
+        object.__setattr__(config, "post_max_age_hours", 12)
+        batch_size = _keywords_per_cycle(len(ALL_KEYWORDS))
+        full_rotation_hours = (len(ALL_KEYWORDS) / batch_size) * 1
+        assert batch_size >= 5
+        assert full_rotation_hours < config.post_max_age_hours
+    finally:
+        object.__setattr__(config, "search_interval_minutes", original_interval)
+        object.__setattr__(config, "post_max_age_hours", original_age)
