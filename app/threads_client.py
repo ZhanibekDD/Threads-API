@@ -49,18 +49,19 @@ class ThreadsClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    def _require_user_id(self) -> str:
+    async def _get_user_id(self) -> str:
+        """Resolve the Threads user id lazily from /me when it was not set in
+        .env. OAuth already gives us a valid token, so requiring a duplicate
+        THREADS_USER_ID setting made publishing fail after an otherwise
+        successful account connection."""
+        if self.user_id:
+            return self.user_id
+        me = await self.get_me()
+        self.user_id = str(me.get("id") or "")
         if not self.user_id:
             raise ThreadsAPIError(
                 400,
-                {
-                    "error": {
-                        "message": (
-                            "Threads user id is missing. Reconnect the account in the review panel "
-                            "or set THREADS_USER_ID in .env."
-                        )
-                    }
-                },
+                {"error": {"message": "Threads API /me did not return a user id."}},
             )
         return self.user_id
 
@@ -175,8 +176,9 @@ class ThreadsClient:
         return await self._request("GET", "/me", params={"fields": fields})
 
     async def get_mentions(self, fields: str = "id,text,username,permalink,timestamp") -> dict:
+        user_id = await self._get_user_id()
         return await self._request(
-            "GET", f"/{self._require_user_id()}/mentions", params={"fields": fields}
+            "GET", f"/{user_id}/mentions", params={"fields": fields}
         )
 
     async def get_replies(self, media_id: str,
@@ -186,16 +188,18 @@ class ThreadsClient:
     # -- Publishing -----------------------------------------------------------
 
     async def create_reply_container(self, text: str, reply_to_id: str) -> dict:
+        user_id = await self._get_user_id()
         return await self._request(
             "POST",
-            f"/{self._require_user_id()}/threads",
+            f"/{user_id}/threads",
             params={"media_type": "TEXT", "text": text, "reply_to_id": reply_to_id},
         )
 
     async def publish_container(self, creation_id: str) -> dict:
+        user_id = await self._get_user_id()
         return await self._request(
             "POST",
-            f"/{self._require_user_id()}/threads_publish",
+            f"/{user_id}/threads_publish",
             params={"creation_id": creation_id},
         )
 
@@ -214,9 +218,10 @@ class ThreadsClient:
         return await self._request("DELETE", f"/{media_id}")
 
     async def create_own_post(self, text: str) -> str:
+        user_id = await self._get_user_id()
         container = await self._request(
             "POST",
-            f"/{self._require_user_id()}/threads",
+            f"/{user_id}/threads",
             params={"media_type": "TEXT", "text": text},
         )
         await asyncio.sleep(2)
