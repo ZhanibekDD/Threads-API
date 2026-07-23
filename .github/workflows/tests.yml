@@ -21,4 +21,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run tests
-        run: python -m pytest -q
+        id: pytest
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=short 2>&1 | tee pytest-output.txt
+          test_status=${PIPESTATUS[0]}
+          echo "exit_code=$test_status" >> "$GITHUB_OUTPUT"
+          exit "$test_status"
+      - name: Upload pytest output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: pytest-output.txt
+          retention-days: 3
