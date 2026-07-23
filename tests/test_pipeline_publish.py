@@ -31,7 +31,7 @@ async def test_publish_requires_human_approval(conn):
 
 
 @pytest.mark.asyncio
-async def test_dry_run_never_calls_threads_api(conn):
+async def test_dry_run_never_calls_threads_api_or_marks_published(conn):
     reply_id = _insert_post_and_reply(conn, approved=1)
     object.__setattr__(config, "dry_run", True)
     threads = AsyncMock()
@@ -39,8 +39,10 @@ async def test_dry_run_never_calls_threads_api(conn):
     assert result["status"] == "dry_run_ok"
     threads.publish_reply.assert_not_called()
     row = conn.execute("SELECT * FROM generated_replies WHERE id=?", (reply_id,)).fetchone()
-    assert row["published"] == 1
-    assert row["threads_reply_id"] == "DRY_RUN"
+    assert row["approved"] == 1
+    assert row["published"] == 0
+    assert row["published_at"] is None
+    assert row["threads_reply_id"] is None
 
 
 @pytest.mark.asyncio
