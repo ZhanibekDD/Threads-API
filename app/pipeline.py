@@ -22,9 +22,28 @@ from app.whatsapp import shorten_cta_if_needed
 
 logger = logging.getLogger("pipeline")
 
+# The project has dozens of phrases. Searching every phrase every hour wastes
+# the Meta search quota and makes the worker look alive while every call is
+# being rejected. Two phrases per cycle covers the full list in under a day
+# while keeping a large safety margin for manual searches from the panel.
+DEFAULT_KEYWORDS_PER_CYCLE = 2
+
 
 def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _scheduled_keywords(keywords: list[str]) -> list[str]:
+    """Return a deterministic rotating keyword slice for the current worker
+    interval. A restart in the same interval repeats the same tiny slice rather
+    than unexpectedly consuming another full-list burst."""
+    if not keywords:
+        return []
+    batch_size = min(DEFAULT_KEYWORDS_PER_CYCLE, len(keywords))
+    interval_seconds = max(config.search_interval_minutes * 60, 60)
+    slot = int(datetime.now(timezone.utc).timestamp() // interval_seconds)
+    start = (slot * batch_size) % len(keywords)
+    return [keywords[(start + offset) % len(keywords)] for offset in range(batch_size)]
 
 
 def _recent_published_comments(conn: sqlite3.Connection, limit: int = 50) -> list[str]:
@@ -49,43 +68,76 @@ def _upsert_author_seen(conn: sqlite3.Connection, author_id: str, username: str)
 
 async def search_and_ingest(threads: ThreadsClient, deepseek: DeepSeekClient,
                              conn: sqlite3.Connection, keywords: list[str] | None = None) -> dict:
-    """One search cycle across all keywords. Returns a small summary dict."""
-    keywords = keywords or ALL_KEYWORDS
-    summary = {"searched": 0, "found": 0, "queued": 0, "skipped": 0, "errors": 0}
+    """One search cycle. Automatic cycles rotate through a small keyword
+    batch; explicitly supplied keywords (for example from the web panel) are
+    searched exactly as requested."""
+    active_keywords = _scheduled_keywords(ALL_KEYWORDS) if keywords is None else keywords
+    summary = {
+        "searched": 0,
+        "found": 0,
+        "queued": 0,
+        "skipped": 0,
+        "errors": 0,
+        "keywords": active_keywords,
+    }
     today = _today()
+    logger.info("search_cycle_started keywords=%s", active_keywords)
 
-    for keyword in keywords:
+    for keyword in active_keywords:
         summary["searched"] += 1
         touch_daily_metric(conn, today, searches=1)
         try:
             result = await threads.keyword_search(keyword)
-        except ThreadsAPIError:
+        except ThreadsAPIError as exc:
             logger.exception("search_failed keyword=%s", keyword)
             touch_daily_metric(conn, today, errors=1)
             summary["errors"] += 1
+            summary["last_error"] = {
+                "keyword": keyword,
+                "status_code": exc.status_code,
+                "payload": exc.payload,
+            }
             continue
 
-        for item in result.get("data", []):
+        for raw_item in result.get("data", []):
             summary["found"] += 1
             touch_daily_metric(conn, today, posts_found=1)
-            outcome = await _process_post(threads, deepseek, conn, item, today)
+            item = dict(raw_item)
+            item["_matched_keyword"] = keyword
+            try:
+                outcome = await _process_post(threads, deepseek, conn, item, today)
+            except Exception:
+                # One malformed API item, database edge case, or downstream
+                # model error must not kill the entire long-running worker.
+                logger.exception("post_processing_failed post_id=%s keyword=%s",
+                                 item.get("id"), keyword)
+                touch_daily_metric(conn, today, errors=1)
+                summary["errors"] += 1
+                summary["skipped"] += 1
+                continue
             if outcome == "queued":
                 summary["queued"] += 1
             else:
                 summary["skipped"] += 1
 
+    logger.info("search_cycle_finished summary=%s", summary)
     return summary
 
 
 async def _process_post(threads: ThreadsClient, deepseek: DeepSeekClient,
                          conn: sqlite3.Connection, item: dict, today: str) -> str:
     post_id = item.get("id")
-    author_id = item.get("username") or item.get("owner", {}).get("id", "")
+    username = item.get("username", "")
+    owner = item.get("owner") or {}
+    owner_id = owner.get("id", "") if isinstance(owner, dict) else str(owner)
+    author_id = owner_id or username
     text = item.get("text", "")
     permalink = item.get("permalink", "")
     published_at = item.get("timestamp") or now_iso()
 
-    if not post_id or not text:
+    if not post_id or not text or not author_id:
+        logger.info("post_skipped_missing_fields post_id=%s has_text=%s author_id=%s",
+                    post_id, bool(text), bool(author_id))
         return "skipped"
 
     if conn.execute("SELECT 1 FROM threads_posts WHERE threads_post_id = ?", (post_id,)).fetchone():
@@ -106,13 +158,13 @@ async def _process_post(threads: ThreadsClient, deepseek: DeepSeekClient,
         logger.info("post_skipped_author_cooldown post_id=%s", post_id)
         return "skipped"
 
-    _upsert_author_seen(conn, author_id, item.get("username", ""))
+    _upsert_author_seen(conn, author_id, username)
 
     conn.execute(
         "INSERT INTO threads_posts (threads_post_id, author_id, author_username, text, "
         "permalink, found_keyword, published_at, found_at, status) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new')",
-        (post_id, author_id, item.get("username", ""), text, permalink,
+        (post_id, author_id, username, text, permalink,
          item.get("_matched_keyword", ""), published_at, now_iso()),
     )
     row_id = conn.execute("SELECT id FROM threads_posts WHERE threads_post_id = ?",
@@ -205,7 +257,7 @@ async def publish_approved_reply(threads: ThreadsClient, conn: sqlite3.Connectio
         conn.execute("UPDATE generated_replies SET error = ? WHERE id = ?",
                      (f"threads_api_error:{exc.status_code}", reply_id))
         touch_daily_metric(conn, today, errors=1)
-        return {"status": "error", "error": str(exc.status_code)}
+        return {"status": "error", "error": str(exc.status_code), "payload": exc.payload}
 
     conn.execute(
         "UPDATE generated_replies SET published = 1, published_at = ?, threads_reply_id = ? "
