@@ -71,19 +71,19 @@ CREATE TABLE IF NOT EXISTS own_content (
     language TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    pillar TEXT,
+    funnel_stage TEXT,
+    topic TEXT,
+    cta_code TEXT,
     exported INTEGER NOT NULL DEFAULT 0,
-    -- A human must set approved=1 (CLI `approve-content` or the panel) before
-    -- the scheduler will ever publish this row — the schedule controls WHEN,
-    -- a person still controls WHETHER. See app/content_generator.py.
     approved INTEGER NOT NULL DEFAULT 0,
+    rejected INTEGER NOT NULL DEFAULT 0,
     published INTEGER NOT NULL DEFAULT 0,
     published_at TEXT,
     threads_post_id TEXT,
     error TEXT
 );
 
--- Single-account internal tool: one row (id=1) holds the current OAuth token.
--- No multi-user/multi-account support by design.
 CREATE TABLE IF NOT EXISTS oauth_tokens (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     access_token TEXT NOT NULL,
@@ -94,8 +94,6 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     updated_at TEXT NOT NULL
 );
 
--- Short-lived CSRF state values for the OAuth connect/callback flow.
--- Each row is deleted the moment it is checked (one-time use).
 CREATE TABLE IF NOT EXISTS oauth_states (
     state TEXT PRIMARY KEY,
     created_at TEXT NOT NULL
@@ -119,9 +117,14 @@ def get_connection(path: str | None = None) -> sqlite3.Connection:
 
 _OWN_CONTENT_MIGRATIONS = [
     "ALTER TABLE own_content ADD COLUMN approved INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE own_content ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE own_content ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE own_content ADD COLUMN published_at TEXT",
     "ALTER TABLE own_content ADD COLUMN threads_post_id TEXT",
+    "ALTER TABLE own_content ADD COLUMN pillar TEXT",
+    "ALTER TABLE own_content ADD COLUMN funnel_stage TEXT",
+    "ALTER TABLE own_content ADD COLUMN topic TEXT",
+    "ALTER TABLE own_content ADD COLUMN cta_code TEXT",
     "ALTER TABLE own_content ADD COLUMN error TEXT",
 ]
 
@@ -129,8 +132,6 @@ _OWN_CONTENT_MIGRATIONS = [
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.commit()
-    # Databases created before these columns existed need a migration —
-    # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table.
     for statement in _OWN_CONTENT_MIGRATIONS:
         try:
             conn.execute(statement)
@@ -151,29 +152,49 @@ def session(path: str | None = None):
         conn.close()
 
 
-def touch_daily_metric(conn: sqlite3.Connection, date: str, **increments: int) -> None:
+def touch_daily_metric(
+    conn: sqlite3.Connection,
+    date: str,
+    **increments: int,
+) -> None:
     conn.execute(
-        "INSERT INTO daily_metrics (date) VALUES (?) ON CONFLICT(date) DO NOTHING", (date,)
+        "INSERT INTO daily_metrics (date) VALUES (?) "
+        "ON CONFLICT(date) DO NOTHING",
+        (date,),
     )
+    allowed_fields = {
+        "searches",
+        "posts_found",
+        "relevant_posts",
+        "manual_reviews",
+        "replies_published",
+        "website_cta_count",
+        "whatsapp_cta_count",
+        "errors",
+    }
     for field, delta in increments.items():
-        if field not in (
-            "searches", "posts_found", "relevant_posts", "manual_reviews",
-            "replies_published", "website_cta_count", "whatsapp_cta_count", "errors",
-        ):
+        if field not in allowed_fields:
             raise ValueError(f"unknown daily_metrics field: {field}")
         conn.execute(
-            f"UPDATE daily_metrics SET {field} = {field} + ? WHERE date = ?", (delta, date)
+            f"UPDATE daily_metrics SET {field} = {field} + ? WHERE date = ?",
+            (delta, date),
         )
 
 
-def touch_deepseek_usage(conn: sqlite3.Connection, date: str, prompt_tokens: int,
-                          completion_tokens: int) -> None:
+def touch_deepseek_usage(
+    conn: sqlite3.Connection,
+    date: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> None:
     conn.execute(
-        "INSERT INTO deepseek_usage (date) VALUES (?) ON CONFLICT(date) DO NOTHING", (date,)
+        "INSERT INTO deepseek_usage (date) VALUES (?) "
+        "ON CONFLICT(date) DO NOTHING",
+        (date,),
     )
     conn.execute(
         "UPDATE deepseek_usage SET requests = requests + 1, "
-        "prompt_tokens = prompt_tokens + ?, completion_tokens = completion_tokens + ? "
-        "WHERE date = ?",
+        "prompt_tokens = prompt_tokens + ?, "
+        "completion_tokens = completion_tokens + ? WHERE date = ?",
         (prompt_tokens, completion_tokens, date),
     )
