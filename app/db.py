@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS own_content (
     rejected INTEGER NOT NULL DEFAULT 0,
     published INTEGER NOT NULL DEFAULT 0,
     published_at TEXT,
-    threads_post_id TEXT
+    threads_post_id TEXT,
+    error TEXT
 );
 
 -- Single-account internal tool: one row (id=1) holds the current OAuth token.
@@ -126,6 +127,7 @@ _OWN_CONTENT_MIGRATIONS = [
     "ALTER TABLE own_content ADD COLUMN funnel_stage TEXT",
     "ALTER TABLE own_content ADD COLUMN topic TEXT",
     "ALTER TABLE own_content ADD COLUMN cta_code TEXT",
+    "ALTER TABLE own_content ADD COLUMN error TEXT",
 ]
 
 
