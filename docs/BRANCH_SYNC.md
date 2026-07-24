@@ -1,1 +1,0 @@
-Branch synchronization in progress.
