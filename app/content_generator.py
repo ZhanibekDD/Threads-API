@@ -17,9 +17,11 @@ from app.config import config
 from app.db import now_iso
 from app.dedup import is_too_similar
 from app.deepseek_client import DeepSeekClient
-from app.threads_client import ThreadsClient
+from app.threads_client import ThreadsAPIError, ThreadsClient
 
 logger = logging.getLogger("content_generator")
+
+THREADS_POST_MAX_CHARS = 500
 
 
 OWN_CONTENT_SYSTEM_PROMPT = """Ты — сильный контент-маркетолог юридического сервиса ZakonExpert в Казахстане.
@@ -285,7 +287,8 @@ def export_content(conn: sqlite3.Connection, out_dir: str = "./exports") -> str:
     """Export un-exported own_content rows to CSV and mark them exported."""
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     rows = conn.execute("SELECT * FROM own_content WHERE exported = 0 ORDER BY id").fetchall()
-    out_path = Path(out_dir) / f"content_{now_iso().replace(':', '-')}.csv"
+    out_path = Path(out_dir) / f"content_{now_iso().replace(':', '-')} .csv"
+    out_path = Path(str(out_path).replace(" -", "-"))
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -364,10 +367,48 @@ async def publish_content_by_id(
             "threads_post_id": row["threads_post_id"],
         }
 
-    post_id = await threads.create_own_post(row["content"])
+    length = len(row["content"])
+    if length > THREADS_POST_MAX_CHARS:
+        error = (
+            f"content is {length} chars, over the {THREADS_POST_MAX_CHARS} "
+            "limit — needs manual editing"
+        )
+        conn.execute(
+            "UPDATE own_content SET approved = 0, error = ? WHERE id = ?",
+            (error, row["id"]),
+        )
+        conn.commit()
+        logger.warning("own_content_too_long id=%s length=%s", row["id"], length)
+        return {
+            "status": "content_too_long",
+            "id": row["id"],
+            "length": length,
+        }
+
+    try:
+        post_id = await threads.create_own_post(row["content"])
+    except ThreadsAPIError as exc:
+        error = f"threads_api_error:{exc.status_code}"
+        conn.execute(
+            "UPDATE own_content SET approved = 0, error = ? WHERE id = ?",
+            (error, row["id"]),
+        )
+        conn.commit()
+        logger.error(
+            "own_content_publish_failed id=%s status=%s",
+            row["id"],
+            exc.status_code,
+        )
+        return {
+            "status": "error",
+            "id": row["id"],
+            "error": error,
+            "payload": exc.payload,
+        }
+
     conn.execute(
         "UPDATE own_content SET approved = 1, published = 1, published_at = ?, "
-        "threads_post_id = ?, exported = 1 WHERE id = ?",
+        "threads_post_id = ?, exported = 1, error = NULL WHERE id = ?",
         (now_iso(), post_id, row["id"]),
     )
     conn.commit()
@@ -382,8 +423,8 @@ async def publish_next_approved(
     """Publish the oldest approved, non-rejected Threads post."""
     row = conn.execute(
         "SELECT * FROM own_content "
-        "WHERE type = 'post' AND approved = 1 AND rejected = 0 AND published = 0 "
-        "ORDER BY id LIMIT 1"
+        "WHERE type = 'post' AND approved = 1 AND rejected = 0 "
+        "AND published = 0 AND error IS NULL ORDER BY id LIMIT 1"
     ).fetchone()
     if row is None:
         return {"status": "nothing_to_publish"}
